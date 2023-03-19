@@ -238,7 +238,7 @@ static __always_inline int ipv4_to_6(struct __sk_buff *skb, size_t offset){
 	}
 	int total_hdr_len = rc;
 
-	unsigned char buf[sizeof(struct ip6_hdr) + sizeof(struct ip6_frag)];
+	unsigned char buf[sizeof(struct ip6_hdr) + sizeof(struct ip6_frag) + 8] = {0};
 	struct ip6_hdr *ip6h = (struct ip6_hdr *)buf;
 	struct iphdr *iph = (struct iphdr *)(skb->data + offset);
 	bpf_skb_valid_ptr(skb, iph);
@@ -248,6 +248,9 @@ static __always_inline int ipv4_to_6(struct __sk_buff *skb, size_t offset){
 	
 	//int is_icmp = iph.protocol == IPPROTO_ICMP;
 	int is_frag = bpf_ntohs(iph->frag_off) & IP_MF || bpf_ntohs(iph->frag_off) & IP_OFFMASK;
+
+	int additional_size_fake_opt = iph->ihl * 4 % 8 == 0 ? 0 : 8 - iph->ihl * 4 % 8;
+
 	rc = addr_translate_4to6((const struct in_addr *)&iph->saddr, &ip6h->ip6_src, &src_4to6_map);
 	if(rc != 0){
 		return rc;
@@ -258,7 +261,7 @@ static __always_inline int ipv4_to_6(struct __sk_buff *skb, size_t offset){
 	}
 
 	ip6h->ip6_flow = bpf_htonl(6 << 28 | iph->tos << 20);
-	ip6h->ip6_plen = bpf_htons(bpf_ntohs(iph->tot_len) - iph->ihl * 4 + (is_frag ? sizeof(struct ip6_frag) : 0));
+	ip6h->ip6_plen = bpf_htons(bpf_ntohs(iph->tot_len) /*- iph->ihl * 4*/ + (is_frag ? sizeof(struct ip6_frag) : 0) + additional_size_fake_opt);
 	ip6h->ip6_nxt  = iph->protocol;
 	ip6h->ip6_hlim = iph->ttl;
 	if(is_frag){
@@ -290,20 +293,44 @@ static __always_inline int ipv4_to_6(struct __sk_buff *skb, size_t offset){
 		}
 	}
 */
-	total_hdr_len -= iph->ihl * 4;
+	//total_hdr_len -= iph->ihl * 4;
+	total_hdr_len += additional_size_fake_opt;
 
-	struct ip6_ext *fake_ipv6_opt = (struct ip6_ext *)iph;
-	fake_ipv6_opt->ip6e_len = iph->ihl * 4 - 1;
+	struct ip6_ext *fake_ipv6_opt = (struct ip6_ext *)(ip6h + 1);
+	if(is_frag){
+		struct ip6_frag *ip6f = (struct ip6_frag *)(ip6h + 1);
+		ip6f->ip6f_nxt = IPPROTO_DSTOPTS;
+		fake_ipv6_opt = (struct ip6_ext *)(ip6f + 1);
+	}else{
+		ip6h->ip6_nxt = IPPROTO_DSTOPTS;
+	}
 	fake_ipv6_opt->ip6e_nxt = iph->protocol;
-	fake_ipv6_opt[1].ip6e_len = fake_ipv6_opt->ip6e_len - 3;
+	fake_ipv6_opt->ip6e_len = ((int)iph->ihl * 4 + 7)/ 8 - 1;
 	fake_ipv6_opt[1].ip6e_nxt = IP6OPT_PADN;
-	ip6h->ip6_nxt = IPPROTO_DSTOPTS;
-	ip6h->ip6_plen = bpf_htons(bpf_ntohs(ip6h->ip6_plen) + fake_ipv6_opt->ip6e_len + 1);
+	fake_ipv6_opt[1].ip6e_len = iph->ihl * 4 + additional_size_fake_opt - 4;
+
+	if(UNLIKELY(additional_size_fake_opt < 4)){
+		switch (additional_size_fake_opt)
+		{
+			case 0:
+				memcpy(iph, fake_ipv6_opt, 4);
+				break;
+			case 1:
+				memcpy(iph, (unsigned char *)fake_ipv6_opt + 1, 3);
+				break;
+			case 2:
+				memcpy(iph, (unsigned char *)fake_ipv6_opt + 2, 2);
+				break;
+			case 3:
+				memcpy(iph, (unsigned char *)fake_ipv6_opt + 3, 1);
+				break;
+		}
+	}
 	/*rc = bpf_skb_adjust_room(skb, iph->ihl * 4, BPF_ADJ_ROOM_MAC, 0);
 	if(UNLIKELY(rc < 0)){
 		return rc;
 	}*/
-	size_t len_should_push = sizeof(struct ip6_hdr);
+	size_t len_should_push = sizeof(struct ip6_hdr) + additional_size_fake_opt;
 	if(is_frag){
 		len_should_push += sizeof(struct ip6_frag);
 	}
