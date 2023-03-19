@@ -291,6 +291,14 @@ static __always_inline int ipv4_to_6(struct __sk_buff *skb, size_t offset){
 	}
 */
 	total_hdr_len -= iph->ihl * 4;
+
+	struct ip6_ext *fake_ipv6_opt = (struct ip6_ext *)iph;
+	fake_ipv6_opt->ip6e_len = iph->ihl * 4 - 1;
+	fake_ipv6_opt->ip6e_nxt = iph->protocol;
+	fake_ipv6_opt[1].ip6e_len = fake_ipv6_opt->ip6e_len - 3;
+	fake_ipv6_opt[1].ip6e_nxt = IP6OPT_PADN;
+	ip6h->ip6_nxt = IPPROTO_DSTOPTS;
+	ip6h->ip6_plen = bpf_htons(bpf_ntohs(ip6h->ip6_plen) + fake_ipv6_opt->ip6e_len + 1);
 	/*rc = bpf_skb_adjust_room(skb, iph->ihl * 4, BPF_ADJ_ROOM_MAC, 0);
 	if(UNLIKELY(rc < 0)){
 		return rc;
