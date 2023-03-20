@@ -92,29 +92,19 @@ struct bpf_elf_map icmp_err_src_addr = {
 	.max_elem = 1,
 };
 
-static __always_inline int bpf_skb_is_data_sz_gt(const struct __sk_buff *skb, size_t size){
-	return (unsigned long)skb->data + size <= (unsigned long)skb->data_end;
+static __always_inline long bpf_xdp_is_data_sz_gt(const struct xdp_md *pbf, size_t size){
+	return (unsigned long)pbf->data + size <= (unsigned long)pbf->data_end;
 }
 
-static __always_inline int bpf_skb_ensure_bytes(struct __sk_buff *skb, size_t size){
-	if(UNLIKELY(skb->len < size)){
-		return -EINVAL;
-	}
-	if(LIKELY(bpf_skb_is_data_sz_gt(skb, size))){
-		return 0;
-	}
-	int rc;
-	if(UNLIKELY((rc = bpf_skb_pull_data(skb, size)) < 0)){
-		return rc;
-	}
-	if(LIKELY(bpf_skb_is_data_sz_gt(skb, size))){
+static __always_inline long bpf_xdp_ensure_bytes(struct xdp_md *pbf, size_t size){
+	if(LIKELY(bpf_xdp_is_data_sz_gt(pbf, size))){
 		return 0;
 	}
 	return -EINVAL;
 }
 
 
-static __always_inline int addr_translate_4to6 (const struct in_addr *addr4, struct in6_addr *addr6, struct bpf_elf_map *map){
+static __always_inline long addr_translate_4to6 (const struct in_addr *addr4, struct in6_addr *addr6, struct bpf_elf_map *map){
 	struct ipv4_lpm_key key = {
 		.prefixlen = 32,
 		.addr = *addr4,
@@ -183,16 +173,16 @@ static __always_inline int addr_translate_4to6 (const struct in_addr *addr4, str
 	return 0;
 }
 
-static __always_inline int icmp_send(struct __sk_buff *skb, __u8 type, __u8 code, __u32 info){
+static __always_inline long icmp_send(struct xdp_md *pbf, __u8 type, __u8 code, __u32 info){
 	return -ENOSYS;
 }
 
-static __always_inline int bpf_skb_ensure_ipv4_header(struct __sk_buff *skb, size_t offset){
+static __always_inline int bpf_xdp_ensure_ipv4_header(struct xdp_md *pbf, size_t offset){
 	int rc;
-	if(UNLIKELY((rc = bpf_skb_ensure_bytes(skb, offset + sizeof(struct iphdr))) < 0)){
+	if(UNLIKELY((rc = bpf_xdp_ensure_bytes(pbf, offset + sizeof(struct iphdr))) < 0)){
 		return rc;
 	}
-	const struct iphdr *iph = (struct iphdr *)(skb->data + offset);
+	const struct iphdr *iph = (struct iphdr *)(pbf->data + offset);
 	if(UNLIKELY(iph->version != 4)){
 		return -EINVAL;
 	}
@@ -219,132 +209,120 @@ static __always_inline int bpf_skb_ensure_ipv4_header(struct __sk_buff *skb, siz
 	if(UNLIKELY(bpf_ntohs(iph->tot_len) < length)){
 		return -EINVAL;
 	}
-	rc = bpf_skb_ensure_bytes(skb, offset + length);
+	rc = bpf_xdp_ensure_bytes(pbf, offset + length);
 	if(UNLIKELY(rc < 0)){
 		return rc;
 	}
 	return length;
 }
 
-#define bpf_skb_valid_ptr(skb, ptr) \
-	({if(UNLIKELY((void *)((ptr) + 1) > (void *)(unsigned long)((skb)->data_end))){ \
+#define bpf_xdp_valid_ptr(pbf, ptr) \
+	({if(UNLIKELY((void *)((ptr) + 1) > (void *)(unsigned long)((pbf)->data_end))){ \
+		return -EINVAL; \
+	}})
+#define bpf_xdp_valid_ptr_len(pbf, ptr, len) \
+	({if(UNLIKELY(((void *)(ptr) + (unsigned long)(len)) > (void *)(unsigned long)((pbf)->data_end))){ \
 		return -EINVAL; \
 	}})
 
-static __always_inline int ipv4_to_6(struct __sk_buff *skb, size_t offset){
-	int rc;
-	if(UNLIKELY((rc = bpf_skb_ensure_ipv4_header(skb, offset)) < 0)){
+static __always_inline long bpf_xdp_adjust_head_at(struct xdp_md *pbf, ssize_t len_diff, size_t offset){
+	if(len_diff > 0){
+		long rc = bpf_xdp_adjust_head(pbf, -len_diff);
+		if(UNLIKELY(rc < 0)){
+			return rc;
+		}
+		void *dst = (void *)(unsigned long)pbf->data;
+		bpf_xdp_valid_ptr_len(pbf, dst, offset);
+		void *src = (void *)(unsigned long)(pbf->data + len_diff);
+		bpf_xdp_valid_ptr_len(pbf, src, offset);
+		memmove(dst, src, offset);
+	}else if(len_diff < 0){
+		void *dst = (void *)(unsigned long)(pbf->data - len_diff);
+		bpf_xdp_valid_ptr_len(pbf, dst, offset);
+		void *src = (void *)(unsigned long)(pbf->data);
+		bpf_xdp_valid_ptr_len(pbf, src, offset);
+		memmove(dst, src, offset);
+		long rc = bpf_xdp_adjust_head(pbf, -len_diff);
+		if(UNLIKELY(rc < 0)){
+			return rc;
+		}
+	}
+	return 0;
+}
+
+static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
+	long rc;
+	if(UNLIKELY((rc = bpf_xdp_ensure_ipv4_header(pbf, offset)) < 0)){
 		return rc;
 	}
-	int total_hdr_len = rc;
+	//size_t total_hdr_len = rc;
 
-	unsigned char buf[sizeof(struct ip6_hdr) + sizeof(struct ip6_frag) + 8] = {0};
-	struct ip6_hdr *ip6h = (struct ip6_hdr *)buf;
-	struct iphdr *iph = (struct iphdr *)(skb->data + offset);
-	bpf_skb_valid_ptr(skb, iph);
+	struct iphdr _iph = *(struct iphdr *)(pbf->data + offset);
+	struct iphdr *iph = &_iph;
+
 	if(iph->ttl <= 1){
-		return icmp_send(skb, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
+		return icmp_send(pbf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
 	}
 	
 	//int is_icmp = iph.protocol == IPPROTO_ICMP;
 	int is_frag = bpf_ntohs(iph->frag_off) & IP_MF || bpf_ntohs(iph->frag_off) & IP_OFFMASK;
 
-	int additional_size_fake_opt = iph->ihl * 4 % 8 == 0 ? 0 : 8 - iph->ihl * 4 % 8;
+	struct in6_addr src, dst;
 
-	rc = addr_translate_4to6((const struct in_addr *)&iph->saddr, &ip6h->ip6_src, &src_4to6_map);
+	rc = addr_translate_4to6((const struct in_addr *)&iph->saddr, &src, &src_4to6_map);
 	if(rc != 0){
 		return rc;
 	}
-	rc = addr_translate_4to6((const struct in_addr *)&iph->daddr, &ip6h->ip6_dst, &dst_4to6_map);
+	rc = addr_translate_4to6((const struct in_addr *)&iph->daddr, &dst, &dst_4to6_map);
 	if(rc != 0){
 		return rc;
 	}
+
+	ssize_t len_diff = sizeof(struct ip6_hdr) - iph->ihl * 4;
+	if(is_frag){
+		len_diff += sizeof(struct ip6_frag);
+	}
+	if(len_diff){
+		rc = bpf_xdp_adjust_head_at(pbf, len_diff, offset);
+		if(UNLIKELY(rc < 0)){
+			return rc;
+		}
+	}
+	struct ip6_hdr *ip6h = (struct ip6_hdr *)(pbf->data + offset);
+	bpf_xdp_valid_ptr(pbf, ip6h);
 
 	ip6h->ip6_flow = bpf_htonl(6 << 28 | iph->tos << 20);
-	ip6h->ip6_plen = bpf_htons(bpf_ntohs(iph->tot_len) /*- iph->ihl * 4*/ + (is_frag ? sizeof(struct ip6_frag) : 0) + additional_size_fake_opt);
+	ip6h->ip6_plen = bpf_htons(bpf_ntohs(iph->tot_len) - iph->ihl * 4 + (is_frag ? sizeof(struct ip6_frag) : 0));
 	ip6h->ip6_nxt  = iph->protocol;
-	ip6h->ip6_hlim = iph->ttl;
+	ip6h->ip6_hlim = iph->ttl - 1;
+	ip6h->ip6_src  = src;
+	ip6h->ip6_dst  = dst;
 	if(is_frag){
 		struct ip6_frag *ip6f = (struct ip6_frag *)(ip6h + 1);
+		bpf_xdp_valid_ptr(pbf, ip6f);
 		ip6f->ip6f_nxt = ip6h->ip6_nxt;
 		ip6h->ip6_nxt = IPPROTO_FRAGMENT;
 		ip6f->ip6f_reserved = 0;
 		ip6f->ip6f_offlg = bpf_htons((bpf_ntohs(iph->frag_off) & IP_OFFMASK) << 3 ) | (bpf_ntohs(iph->frag_off) & IP_MF ? IP6F_MORE_FRAG : 0);
 		ip6f->ip6f_ident = bpf_htonl(bpf_ntohs(iph->id));
 	}
-/*
-	rc = bpf_skb_change_proto(skb, ETH_P_IPV6, 0);
-	if(UNLIKELY(rc < 0)){
-		return rc;
-	}
+	return 0;
+}
 
-	//We need to add len_diff bytes
-	ssize_t len_diff = sizeof(struct ip6_hdr) - iph->ihl * 4;
-	if(is_frag){
-		len_diff += sizeof(struct ip6_frag);
-	}
-	total_hdr_len += len_diff;
-	//bpf_skb_change_proto has already added 20 bytes
-	len_diff -= sizeof(struct ip6_hdr) - sizeof(struct iphdr);
-	if(len_diff){
-		rc = bpf_skb_adjust_room(skb, len_diff, BPF_ADJ_ROOM_MAC, 0);
+static __always_inline long eth_ipv4_to_6(struct xdp_md *pbf){
+	struct ethhdr *ethh = (struct ethhdr *)(unsigned long)pbf->data;
+	bpf_xdp_valid_ptr(pbf, ethh);
+	if(ethh->h_proto == bpf_htons(ETH_P_IP)){
+		long rc = ipv4_to_6(pbf, sizeof(struct ethhdr));
 		if(UNLIKELY(rc < 0)){
 			return rc;
 		}
+		ethh = (struct ethhdr *)(unsigned long)pbf->data;
+		bpf_xdp_valid_ptr(pbf, ethh);
+		ethh->h_proto = bpf_htons(ETH_P_IPV6);
+		return 0;
 	}
-*/
-	//total_hdr_len -= iph->ihl * 4;
-	total_hdr_len += additional_size_fake_opt;
-
-	struct ip6_ext *fake_ipv6_opt = (struct ip6_ext *)(ip6h + 1);
-	if(is_frag){
-		struct ip6_frag *ip6f = (struct ip6_frag *)(ip6h + 1);
-		ip6f->ip6f_nxt = IPPROTO_DSTOPTS;
-		fake_ipv6_opt = (struct ip6_ext *)(ip6f + 1);
-	}else{
-		ip6h->ip6_nxt = IPPROTO_DSTOPTS;
-	}
-	fake_ipv6_opt->ip6e_nxt = iph->protocol;
-	fake_ipv6_opt->ip6e_len = ((int)iph->ihl * 4 + 7)/ 8 - 1;
-	fake_ipv6_opt[1].ip6e_nxt = IP6OPT_PADN;
-	fake_ipv6_opt[1].ip6e_len = iph->ihl * 4 + additional_size_fake_opt - 4;
-
-	if(UNLIKELY(additional_size_fake_opt < 4)){
-		switch (additional_size_fake_opt)
-		{
-			case 0:
-				memcpy(iph, fake_ipv6_opt, 4);
-				break;
-			case 1:
-				memcpy(iph, (unsigned char *)fake_ipv6_opt + 1, 3);
-				break;
-			case 2:
-				memcpy(iph, (unsigned char *)fake_ipv6_opt + 2, 2);
-				break;
-			case 3:
-				memcpy(iph, (unsigned char *)fake_ipv6_opt + 3, 1);
-				break;
-		}
-	}
-	/*rc = bpf_skb_adjust_room(skb, iph->ihl * 4, BPF_ADJ_ROOM_MAC, 0);
-	if(UNLIKELY(rc < 0)){
-		return rc;
-	}*/
-	size_t len_should_push = sizeof(struct ip6_hdr) + additional_size_fake_opt;
-	if(is_frag){
-		len_should_push += sizeof(struct ip6_frag);
-	}
-	total_hdr_len += len_should_push;
-	rc = bpf_lwt_push_encap(skb, BPF_LWT_ENCAP_IP, buf, len_should_push);
-	skb->cb[0] = skb->cb[1] = skb->cb[2] = skb->cb[3] = skb->cb[4] = 0;
-	if(UNLIKELY(rc < 0)){
-		return rc;
-	}
-	rc = bpf_skb_ensure_bytes(skb, offset + total_hdr_len);
-	if(UNLIKELY(rc < 0)){
-		return rc;
-	}
-	return 0;
+	return -EINVAL;
 }
 
 /*static __always_inline int icmpv6_reply(struct __sk_buff *skb)
@@ -424,14 +402,14 @@ static __always_inline int ipv4_to_6(struct __sk_buff *skb, size_t offset){
 	int handled;
 };*/
 
-SEC("xmit")
-long lwt_xmit(struct __sk_buff *skb)
+SEC("xdp:4to6")
+long xslat46(struct xdp_md *pbf)
 {
-	long rc = ipv4_to_6(skb, 0);
+	long rc = eth_ipv4_to_6(pbf);
 	if(rc < 0){
-		return rc;
+		return XDP_DROP;
 	}else{
-		return BPF_LWT_REROUTE;
+		return XDP_PASS;
 	}
 }
 
