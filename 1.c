@@ -114,22 +114,40 @@ static __always_inline long addr_translate_4to6 (const struct in_addr *addr4, st
 	masked_addr4 <<= value->ip4_prefixlen;
 	if(value->ip6_prefixlen < 128){
 		int which_dword = value->ip6_prefixlen / 32;
-		uint32_t this_addr32 = bpf_ntohl(addr6->s6_addr32[which_dword]);
+		uint32_t this_addr32 = 0;
+		switch (which_dword)
+		{
+			case 3:
+				this_addr32 = bpf_ntohl(addr6->s6_addr32[3]);
+				break;
+			case 2:
+				this_addr32 = bpf_ntohl(addr6->s6_addr32[2]);
+				break;
+			case 1:
+				this_addr32 = bpf_ntohl(addr6->s6_addr32[1]);
+				break;
+			case 0:
+				this_addr32 = bpf_ntohl(addr6->s6_addr32[0]);
+				break;
+		}
 		this_addr32 &= ~((1ull << (32 - value->ip6_prefixlen % 32)) - 1);
 		this_addr32 |= masked_addr4 >> (value->ip6_prefixlen % 32);
-		addr6->s6_addr32[which_dword] = bpf_htonl(this_addr32);
 		masked_addr4 <<= 32 - value->ip6_prefixlen % 32;
 		switch(which_dword){
 			case 3:
+				addr6->s6_addr32[3] = bpf_htonl(this_addr32);
 				break;
 			case 2:
+				addr6->s6_addr32[2] = bpf_htonl(this_addr32);
 				addr6->s6_addr32[3] = bpf_htonl(masked_addr4);
 				break;
 			case 1:
+				addr6->s6_addr32[1] = bpf_htonl(this_addr32);
 				addr6->s6_addr32[2] = bpf_htonl(masked_addr4);
 				addr6->s6_addr32[3] = 0;
 				break;
 			case 0:
+				addr6->s6_addr32[0] = bpf_htonl(this_addr32);
 				addr6->s6_addr32[1] = bpf_htonl(masked_addr4);
 				addr6->s6_addr32[2] = 0;
 				addr6->s6_addr32[3] = 0;
