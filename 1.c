@@ -104,6 +104,7 @@ static __always_inline long addr_translate_4to6 (const struct in_addr *addr4, st
 	if(value->ip6_prefixlen < 128){
 		int which_dword = value->ip6_prefixlen / 32;
 		uint32_t this_addr32 = 0;
+		/* looks silly because the verifier cannot sometimes determine addr6->s6addr[which_dword] is within the memory range */
 		switch (which_dword)
 		{
 			case 3:
@@ -290,7 +291,7 @@ static __always_inline long fill_ipv6_hdr(struct ip6_hdr *ip6h, const struct iph
 	ip6h->ip6_flow = bpf_htonl(6 << 28 | iph->tos << 20);
 	ip6h->ip6_plen = bpf_htons(bpf_ntohs(iph->tot_len) - iph->ihl * 4 + (is_frag ? sizeof(struct ip6_frag) : 0));
 	ip6h->ip6_nxt  = iph->protocol;
-	ip6h->ip6_hlim = iph->ttl - 1;
+	ip6h->ip6_hlim = iph->ttl;
 	long checksum = 0;
 	checksum += addr_translate_4to6((const struct in_addr *)&iph->saddr, &ip6h->ip6_src, src);
 	checksum += addr_translate_4to6((const struct in_addr *)&iph->daddr, &ip6h->ip6_dst, dst);
@@ -332,20 +333,16 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 	const struct ipv4_nat_table_value *src, *dst;
 	src = ipv4_siit_table_lookup((const struct in_addr *)&iph->saddr, &src_4to6_map);
 	if(UNLIKELY(src == NULL)){
-		bpf_printk("sno");
 		return -ENOENT;
 	}
 	if(UNLIKELY(!is_ipv4_siit_table_entry_valid(src))){
-		bpf_printk("sinv");
 		return -EINVAL;
 	}
 	dst = ipv4_siit_table_lookup((const struct in_addr *)&iph->daddr, &dst_4to6_map);
 	if(UNLIKELY(dst == NULL)){
-		bpf_printk("dno");
 		return -ENOENT;
 	}
 	if(UNLIKELY(!is_ipv4_siit_table_entry_valid(dst))){
-		bpf_printk("dinv");
 		return -EINVAL;
 	}
 
@@ -353,7 +350,6 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 	if(len_diff){
 		rc = bpf_xdp_adjust_head_at(pbf, len_diff, offset);
 		if(UNLIKELY(rc < 0)){
-			bpf_printk("eadj");
 			return rc;
 		}
 	}
@@ -363,14 +359,12 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 
 	rc = fill_ipv6_hdr(ip6h, iph, dst, src, &transp_hdr, pbf);
 	if(UNLIKELY(rc < 0)){
-		bpf_printk("efil");
 		return rc;
 	}
 
 	uint64_t checksum_diff = rc;
 	rc = checksum_fill_delta(pbf, transp_hdr, iph->protocol, checksum_diff);	
 	if(UNLIKELY(rc < 0)){
-		bpf_printk("cksu");
 		return rc;
 	}
 	return 0;
