@@ -42,14 +42,6 @@
 # define memmove(dest, src, n)  __builtin_memmove((dest), (src), (n))
 #endif
 
-/*struct bpf_elf_map acc_map __section("maps") = {
-        .type           = BPF_MAP_TYPE_ARRAY,
-        .size_key       = sizeof(uint32_t),
-        .size_value     = sizeof(uint32_t),
-        .pinning        = PIN_GLOBAL_NS,
-        .max_elem       = 2,
-};*/
-
 const int MAP_MAX_LEN = 1024;
 
 struct ipv4_lpm_key {
@@ -686,83 +678,6 @@ static __always_inline long eth_ipv4_to_6(struct xdp_md *pbf){
 	}
 	return -EINVAL;
 }
-
-/*static __always_inline int icmpv6_reply(struct __sk_buff *skb)
-{
-	void *data = (void *)(long)skb->data;
-   	void *data_end = (void *)(long)skb->data_end;
-
-	struct ipv6hdr *ip6h = data;
-	if (data + sizeof(*ip6h) > data_end){
-        	return BPF_DROP;
-	}
-	if (ip6h->version != 6){
-		return BPF_DROP;
-	}
-	if (ip6h->nexthdr != IPPROTO_ICMPV6){
-		return BPF_DROP;
-	}
-
-	struct icmp6hdr *icmpv6h = data + sizeof(*ip6h);
-	if ((void *)icmpv6h + sizeof(*icmpv6h) > data_end){
-		return BPF_DROP;
-	}
-	if(icmpv6h->icmp6_type != ICMPV6_ECHO_REQUEST){
-		return BPF_DROP;
-	}
-	icmpv6h->icmp6_type = ICMPV6_ECHO_REPLY;
-	struct	in6_addr tmp_addr;
-	tmp_addr = ip6h->saddr;
-	ip6h->saddr = ip6h->daddr;
-	ip6h->daddr = tmp_addr;
-
-	bpf_l4_csum_replace(skb, sizeof(*ip6h) + offsetof(struct icmp6hdr, icmp6_cksum), ICMPV6_ECHO_REQUEST, ICMPV6_ECHO_REPLY, sizeof(icmpv6h->icmp6_cksum) | BPF_F_PSEUDO_HDR);
-
-	return BPF_LWT_REROUTE;
-
-
-        return BPF_DROP;
-}*/
-
-/*static __always_inline int dnat(struct __sk_buff *skb){
-	void *data = (void *)(long)skb->data;
-        void *data_end = (void *)(long)skb->data_end;
-
-        struct ipv6hdr *ip6h = data;
-	if (data + sizeof(*ip6h) > data_end){
-                return BPF_DROP;
-        }
-        if (ip6h->version != 6){
-                return BPF_DROP;
-        }
-        if (ip6h->nexthdr != IPPROTO_ICMPV6){
-                return BPF_DROP;
-        }
-	struct icmp6hdr *icmpv6h = data + sizeof(*ip6h);
-        if ((void *)icmpv6h + sizeof(*icmpv6h) > data_end){
-                return BPF_DROP;
-        }
-        if(icmpv6h->icmp6_type != ICMPV6_ECHO_REQUEST){
-                return BPF_DROP;
-        }
-	struct  in6_addr addrs[4];
-	addrs[0] = addrs[2] = ip6h->daddr;
-	addrs[1] = addrs[3] = ip6h->saddr;
-	addrs[2].s6_addr[15] += 1;
-	addrs[3].s6_addr[15] += 1;
-
-	ip6h->daddr = addrs[2];
-	ip6h->saddr = addrs[3];
-
-	bpf_l4_csum_replace(skb, sizeof(*ip6h) + offsetof(struct icmp6hdr, icmp6_cksum), *(uint16_t *) &addrs[0].s6_addr[14], *(uint16_t *) &addrs[2].s6_addr[14], sizeof(icmpv6h->icmp6_cksum) | BPF_F_PSEUDO_HDR);
-	bpf_l4_csum_replace(skb, sizeof(*ip6h) + offsetof(struct icmp6hdr, icmp6_cksum), *(uint16_t *) &addrs[1].s6_addr[14], *(uint16_t *) &addrs[3].s6_addr[14], sizeof(icmpv6h->icmp6_cksum) | BPF_F_PSEUDO_HDR);
-	return BPF_LWT_REROUTE;
-}*/
-
-
-/*struct tun_info{
-	int handled;
-};*/
 
 SEC("xdp:4to6")
 long xslat46(struct xdp_md *pbf)
