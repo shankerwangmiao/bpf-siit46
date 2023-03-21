@@ -551,7 +551,7 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 			if(UNLIKELY((rc = bpf_xdp_ensure_ipv4_header(pbf, (void *)icmp_iph - (void *)(long)pbf->data)) < 0)){
 				return rc;
 			}
-			if(icmp_iph->protocol == IPPROTO_ICMP && is_ip_fragment(iph)){
+			if(icmp_iph->protocol == IPPROTO_ICMP && is_ip_fragment(icmp_iph)){
 				return -ENOSYS;
 			}
 			/* In icmp error payload, we lookup src address in dst map*/
@@ -611,13 +611,13 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 			return rc;
 		}
 		checksum_diff += rc;
+		icmp6h->icmp6_cksum = icmph->checksum;
 		if(icmp_trans_type == ICMP4_XLAT_PAYLOAD){
 			struct ip6_hdr *icmp6_ip6h = (struct ip6_hdr *)(icmp6h + 1);
 			void *inner_transp_hdr;
 			if(icmp_iph -> protocol == IPPROTO_ICMP){
 				icmp_iph->protocol = IPPROTO_ICMPV6;
-				checksum_diff += 0xffff ^ ((IPPROTO_ICMP << 8) | (icmp_iph->ttl));
-				checksum_diff += (icmp_iph->ttl << 8) | (IPPROTO_ICMPV6);
+				checksum_diff += (IPPROTO_ICMPV6 << 8) + (0xffff ^ (IPPROTO_ICMP << 8));
 			}
 			rc = fill_ipv6_hdr(icmp6_ip6h, icmp_iph, icmp_ip_dst, icmp_ip_src, &inner_transp_hdr, pbf);
 			if(UNLIKELY(rc < 0)){
@@ -627,9 +627,11 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 			checksum_diff += rc; // Include Address Diff
 			checksum_diff += 0xffffffff ^ (*((uint32_t *) icmp_iph + 0)); // Cancel IPv4 Ver IHL TOS LEN
 			checksum_diff += 0xffffffff ^ (*((uint32_t *) icmp_iph + 1)); // Cancel IPv4 ID, Flags, Frag Offset
-			checksum_diff += 0xffff ^ icmp_iph->check; // Cancel IPv4 checksum
+			checksum_diff += 0xffffffff ^ (*((uint32_t *) icmp_iph + 2)); // Cancel IPv4 TTL, Protocol, Checksum
+
 			checksum_diff += *((uint32_t *) icmp6_ip6h + 0); //Include IPv6 Ver TC FL
-			checksum_diff += icmp6_ip6h->ip6_plen; //Include IPv6 Payload Length
+			checksum_diff += *((uint32_t *) icmp6_ip6h + 1); //Include IPv6 Payload Length, Next Header, Hop Limit
+
 			if(icmp6_ip6h->ip6_nxt == IPPROTO_FRAGMENT){ // Include Possible Fragment Header
 				struct ip6_frag *icmp6_ip6f = (struct ip6_frag *)(icmp6_ip6h + 1);
 				bpf_xdp_valid_ptr(pbf, icmp6_ip6f);
@@ -638,9 +640,10 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 			}
 
 			if(LIKELY(!is_ip_following_fragment(icmp_iph))){
-				if(icmp_iph->protocol == IPPROTO_ICMP){
+				if(icmp_iph->protocol == IPPROTO_ICMPV6){
 					inner_checksum_diff = 0;
 					struct icmp6_hdr *inner_icmp6h = (struct icmp6_hdr *)inner_transp_hdr;
+					bpf_xdp_valid_ptr(pbf, inner_icmp6h); // Make the verifier happy
 					if(inner_icmp6h->icmp6_type == ICMP_ECHO){
 						inner_checksum_diff += (0xffff ^ ICMP_ECHO) + ICMP6_ECHO_REQUEST;
 						inner_icmp6h->icmp6_type = ICMP6_ECHO_REQUEST;
