@@ -267,7 +267,7 @@ static __always_inline uint64_t checksum_fold(uint64_t cksum){
 
 static __always_inline long checksum_fill_delta(struct xdp_md *pbf, void *transp_hdr, uint8_t proto, uint64_t checksum_diff){
 	uint64_t delta_checksum = 0;
-	if(proto == IPPROTO_TCP || proto == IPPROTO_UDP){
+	if(proto == IPPROTO_TCP || proto == IPPROTO_UDP || proto == IPPROTO_ICMPV6){
 		uint16_t *checksum_ptr = NULL;
 		if(proto == IPPROTO_TCP){
 			struct tcphdr *tcph = (struct tcphdr *)transp_hdr;
@@ -483,6 +483,7 @@ static __always_inline uint64_t calc_icmpv6_pseudo_checksum(const struct ip6_hdr
 	}else{
 		checksum += bpf_htons(bpf_ntohs(ip6h->ip6_plen) - sizeof(struct ip6_frag));
 	}
+	checksum += ip6h->ip6_nxt << 8;
 	return checksum;
 }
 
@@ -614,6 +615,7 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 			checksum_diff += icmp6_ip6h->ip6_plen; //Include IPv6 Payload Length
 			if(icmp6_ip6h->ip6_nxt == IPPROTO_FRAGMENT){ // Include Possible Fragment Header
 				struct ip6_frag *icmp6_ip6f = (struct ip6_frag *)(icmp6_ip6h + 1);
+				bpf_xdp_valid_ptr(pbf, icmp6_ip6f);
 				checksum_diff += *((uint32_t *) icmp6_ip6f + 0);
 				checksum_diff += *((uint32_t *) icmp6_ip6f + 1);
 			}
