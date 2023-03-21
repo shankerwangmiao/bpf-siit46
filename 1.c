@@ -158,6 +158,14 @@ static __always_inline long icmp_send(struct xdp_md *pbf, __u8 type, __u8 code, 
 	return -ENOSYS;
 }
 
+static __always_inline long is_ip_following_fragment(const struct iphdr *iph){
+	return !!(bpf_ntohs(iph->frag_off) & IP_OFFMASK);
+}
+
+static __always_inline long is_ip_fragment(const struct iphdr *iph){
+	return bpf_ntohs(iph->frag_off) & IP_MF || bpf_ntohs(iph->frag_off) & IP_OFFMASK;
+}
+
 static __always_inline int bpf_xdp_ensure_ipv4_header(struct xdp_md *pbf, size_t offset){
 	int rc;
 	if(UNLIKELY((rc = bpf_xdp_ensure_bytes(pbf, offset + sizeof(struct iphdr))) < 0)){
@@ -174,25 +182,27 @@ static __always_inline int bpf_xdp_ensure_ipv4_header(struct xdp_md *pbf, size_t
 	if(UNLIKELY(bpf_ntohs(iph->tot_len) < length)){
 		return -EINVAL;
 	}
-	switch (iph->protocol){
-	case IPPROTO_TCP:
-		length += sizeof(struct tcphdr);
-		break;
-	case IPPROTO_UDP:
-		length += sizeof(struct udphdr);
-		break;
-	case IPPROTO_ICMP:
-		length += sizeof(struct icmphdr);
-		break;
-	default:
-		break;
-	}
-	if(UNLIKELY(bpf_ntohs(iph->tot_len) < length)){
-		return -EINVAL;
-	}
-	rc = bpf_xdp_ensure_bytes(pbf, offset + length);
-	if(UNLIKELY(rc < 0)){
-		return rc;
+	if(LIKELY(!is_ip_following_fragment(iph))){
+		switch (iph->protocol){
+		case IPPROTO_TCP:
+			length += sizeof(struct tcphdr);
+			break;
+		case IPPROTO_UDP:
+			length += sizeof(struct udphdr);
+			break;
+		case IPPROTO_ICMP:
+			length += sizeof(struct icmphdr);
+			break;
+		default:
+			break;
+		}
+		if(UNLIKELY(bpf_ntohs(iph->tot_len) < length)){
+			return -EINVAL;
+		}
+		rc = bpf_xdp_ensure_bytes(pbf, offset + length);
+		if(UNLIKELY(rc < 0)){
+			return rc;
+		}
 	}
 	return length;
 }
@@ -232,7 +242,7 @@ static __always_inline long bpf_xdp_adjust_head_at(struct xdp_md *pbf, ssize_t l
 }
 
 static __always_inline ssize_t calc_extra_space_ip4_hdr(const struct iphdr *iph){
-	int is_frag = bpf_ntohs(iph->frag_off) & IP_MF || bpf_ntohs(iph->frag_off) & IP_OFFMASK;
+	int is_frag = is_ip_fragment(iph);
 	ssize_t len_diff = sizeof(struct ip6_hdr) - iph->ihl * 4;
 	if(is_frag){
 		len_diff += sizeof(struct ip6_frag);
@@ -336,7 +346,7 @@ static __always_inline long fill_ipv6_hdr(struct ip6_hdr *ip6h, const struct iph
 	if(LIKELY(!!pbf)){
 		bpf_xdp_valid_ptr(pbf, ip6h);
 	}
-	int is_frag = bpf_ntohs(iph->frag_off) & IP_MF || bpf_ntohs(iph->frag_off) & IP_OFFMASK;
+	int is_frag = is_ip_fragment(iph);
 	ip6h->ip6_flow = bpf_htonl(6 << 28 | iph->tos << 20);
 	ip6h->ip6_plen = bpf_htons(bpf_ntohs(iph->tot_len) - iph->ihl * 4 + (is_frag ? sizeof(struct ip6_frag) : 0));
 	ip6h->ip6_nxt  = iph->protocol;
@@ -502,6 +512,10 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 	}
 	iph->ttl -= 1;
 
+	if(iph->protocol == IPPROTO_ICMP && is_ip_fragment(iph)){
+		return -ENOSYS;
+	}
+
 	const struct ipv4_nat_table_value *src, *dst;
 	src = ipv4_siit_table_lookup((const struct in_addr *)&iph->saddr, &src_4to6_map);
 	if(UNLIKELY(src == NULL)){
@@ -536,6 +550,9 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 			struct iphdr *icmp_iph = (struct iphdr *)(icmph + 1);
 			if(UNLIKELY((rc = bpf_xdp_ensure_ipv4_header(pbf, (void *)icmp_iph - (void *)(long)pbf->data)) < 0)){
 				return rc;
+			}
+			if(icmp_iph->protocol == IPPROTO_ICMP && is_ip_fragment(iph)){
+				return -ENOSYS;
 			}
 			/* In icmp error payload, we lookup src address in dst map*/
 			icmp_ip_src = ipv4_siit_table_lookup((const struct in_addr *)&icmp_iph->saddr, &dst_4to6_map);
@@ -620,31 +637,33 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 				checksum_diff += *((uint32_t *) icmp6_ip6f + 1);
 			}
 
-			if(icmp_iph->protocol == IPPROTO_ICMP){
-				inner_checksum_diff = 0;
-				struct icmp6_hdr *inner_icmp6h = (struct icmp6_hdr *)inner_transp_hdr;
-				if(inner_icmp6h->icmp6_type == ICMP_ECHO){
-					inner_checksum_diff += (0xffff ^ ICMP_ECHO) + ICMP6_ECHO_REQUEST;
-					inner_icmp6h->icmp6_type = ICMP6_ECHO_REQUEST;
-				}else if(inner_icmp6h->icmp6_type == ICMP_ECHOREPLY){
-					inner_checksum_diff += (0xffff ^ ICMP_ECHOREPLY) + ICMP6_ECHO_REPLY;
-					inner_icmp6h->icmp6_type = ICMP6_ECHO_REPLY;
+			if(LIKELY(!is_ip_following_fragment(icmp_iph))){
+				if(icmp_iph->protocol == IPPROTO_ICMP){
+					inner_checksum_diff = 0;
+					struct icmp6_hdr *inner_icmp6h = (struct icmp6_hdr *)inner_transp_hdr;
+					if(inner_icmp6h->icmp6_type == ICMP_ECHO){
+						inner_checksum_diff += (0xffff ^ ICMP_ECHO) + ICMP6_ECHO_REQUEST;
+						inner_icmp6h->icmp6_type = ICMP6_ECHO_REQUEST;
+					}else if(inner_icmp6h->icmp6_type == ICMP_ECHOREPLY){
+						inner_checksum_diff += (0xffff ^ ICMP_ECHOREPLY) + ICMP6_ECHO_REPLY;
+						inner_icmp6h->icmp6_type = ICMP6_ECHO_REPLY;
+					}
+					checksum_diff += inner_checksum_diff; //Include ICMPv6 Type Code Checksum
+					inner_checksum_diff += calc_icmpv6_pseudo_checksum(icmp6_ip6h);
 				}
-				checksum_diff += inner_checksum_diff; //Include ICMPv6 Type Code Checksum
-				inner_checksum_diff += calc_icmpv6_pseudo_checksum(icmp6_ip6h);
+				rc = checksum_fill_delta(pbf, inner_transp_hdr, icmp_iph->protocol, inner_checksum_diff);
+				if(UNLIKELY(rc < 0)){
+					return rc;
+				}
+				checksum_diff += rc;
 			}
-			rc = checksum_fill_delta(pbf, inner_transp_hdr, icmp_iph->protocol, inner_checksum_diff);
-			if(UNLIKELY(rc < 0)){
-				return rc;
-			}
-			checksum_diff += rc;
-			
 		}
 	}
-
-	rc = checksum_fill_delta(pbf, transp_hdr, iph->protocol, checksum_diff);
-	if(UNLIKELY(rc < 0)){
-		return rc;
+	if(LIKELY(!is_ip_following_fragment(iph))){
+		rc = checksum_fill_delta(pbf, transp_hdr, iph->protocol, checksum_diff);
+		if(UNLIKELY(rc < 0)){
+			return rc;
+		}
 	}
 	return 0;
 }
