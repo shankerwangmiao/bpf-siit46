@@ -96,18 +96,7 @@ static __always_inline long bpf_xdp_ensure_bytes(struct xdp_md *pbf, size_t size
 }
 
 
-static __always_inline long addr_translate_4to6 (const struct in_addr *addr4, struct in6_addr *addr6, struct bpf_elf_map *map){
-	struct ipv4_lpm_key key = {
-		.prefixlen = 32,
-		.addr = *addr4,
-	};
-	const struct ipv4_nat_table_value *value = bpf_map_lookup_elem(map, &key);
-	if(UNLIKELY(!value)){
-		return -ENOENT;
-	}
-	if(UNLIKELY(value->ip6_prefixlen > 128  || value->ip4_prefixlen > 32 || value->ip6_prefixlen + 32 - value->ip4_prefixlen > 128)){
-		return -EINVAL;
-	}
+static __always_inline long addr_translate_4to6 (const struct in_addr *addr4, struct in6_addr *addr6, const struct ipv4_nat_table_value *value){
 	*addr6 = value->addr;
 	uint32_t masked_addr4 = bpf_ntohl(addr4->s_addr);
 	masked_addr4 &= (1ull << (32 - value->ip4_prefixlen)) - 1;
@@ -240,6 +229,91 @@ static __always_inline long bpf_xdp_adjust_head_at(struct xdp_md *pbf, ssize_t l
 	return 0;
 }
 
+static __always_inline ssize_t calc_extra_space_ip4_hdr(const struct iphdr *iph){
+	int is_frag = bpf_ntohs(iph->frag_off) & IP_MF || bpf_ntohs(iph->frag_off) & IP_OFFMASK;
+	ssize_t len_diff = sizeof(struct ip6_hdr) - iph->ihl * 4;
+	if(is_frag){
+		len_diff += sizeof(struct ip6_frag);
+	}
+	return len_diff;
+}
+
+static __always_inline const struct ipv4_nat_table_value *ipv4_siit_table_lookup(const struct in_addr *addr4, struct bpf_elf_map *map){
+	struct ipv4_lpm_key key = {
+		.prefixlen = 32,
+		.addr = *addr4,
+	};
+	const struct ipv4_nat_table_value *value = bpf_map_lookup_elem(map, &key);
+	if(UNLIKELY(!value)){
+		return NULL;
+	}
+	return value;
+}
+
+static __always_inline long is_ipv4_siit_table_entry_valid(const struct ipv4_nat_table_value *value){
+	return value->ip6_prefixlen <= 128  && value->ip4_prefixlen <= 32 && value->ip6_prefixlen + 32 - value->ip4_prefixlen <= 128;
+}
+
+static __always_inline uint64_t checksum_fold(uint64_t cksum){
+	cksum = (cksum & 0xffffffff) + ((cksum >> 32) & 0xffffffff);
+	cksum = (cksum & 0xffffffff) + ((cksum >> 32) & 0xffffffff);
+	cksum = (cksum & 0xffff) + ((cksum >> 16) & 0xffff);
+	cksum = (cksum & 0xffff) + ((cksum >> 16) & 0xffff);
+	cksum &= 0xffff;
+	return cksum;
+}
+
+static __always_inline long checksum_fill_delta(struct xdp_md *pbf, void *transp_hdr, uint8_t proto, uint64_t checksum_diff){
+	if(proto == IPPROTO_TCP || proto == IPPROTO_UDP){
+		uint16_t *checksum_ptr = NULL;
+		if(proto == IPPROTO_TCP){
+			struct tcphdr *tcph = (struct tcphdr *)transp_hdr;
+			checksum_ptr = &tcph->check;
+		}else if(proto == IPPROTO_UDP){
+			struct udphdr *udph = (struct udphdr *)transp_hdr;
+			checksum_ptr = &udph->check;
+		}
+		bpf_xdp_valid_ptr(pbf, checksum_ptr);
+		checksum_diff += (0xffff ^ *checksum_ptr);
+		checksum_diff = checksum_fold(checksum_diff);
+		if(checksum_diff == 0xffff && proto == IPPROTO_UDP) checksum_diff = 0;
+		*checksum_ptr = 0xffff ^ checksum_diff;
+	}
+	return 0;
+}
+
+static __always_inline long fill_ipv6_hdr(struct ip6_hdr *ip6h, const struct iphdr *iph, const struct ipv4_nat_table_value *dst, const struct ipv4_nat_table_value *src, void **transp_hdr, struct xdp_md *pbf){
+	if(LIKELY(!!pbf)){
+		bpf_xdp_valid_ptr(pbf, ip6h);
+	}
+	int is_frag = bpf_ntohs(iph->frag_off) & IP_MF || bpf_ntohs(iph->frag_off) & IP_OFFMASK;
+	ip6h->ip6_flow = bpf_htonl(6 << 28 | iph->tos << 20);
+	ip6h->ip6_plen = bpf_htons(bpf_ntohs(iph->tot_len) - iph->ihl * 4 + (is_frag ? sizeof(struct ip6_frag) : 0));
+	ip6h->ip6_nxt  = iph->protocol;
+	ip6h->ip6_hlim = iph->ttl - 1;
+	long checksum = 0;
+	checksum += addr_translate_4to6((const struct in_addr *)&iph->saddr, &ip6h->ip6_src, src);
+	checksum += addr_translate_4to6((const struct in_addr *)&iph->daddr, &ip6h->ip6_dst, dst);
+	if(LIKELY(!!transp_hdr)){
+		*transp_hdr = (void *)(ip6h + 1);
+	}
+	if(is_frag){
+		struct ip6_frag *ip6f = (struct ip6_frag *)(ip6h + 1);
+		if(LIKELY(!!transp_hdr)){
+			*transp_hdr = ip6f + 1;
+		}
+		if(LIKELY(!!pbf)){
+			bpf_xdp_valid_ptr(pbf, ip6f);
+		}
+		ip6f->ip6f_nxt = ip6h->ip6_nxt;
+		ip6h->ip6_nxt = IPPROTO_FRAGMENT;
+		ip6f->ip6f_reserved = 0;
+		ip6f->ip6f_offlg = bpf_htons((bpf_ntohs(iph->frag_off) & IP_OFFMASK) << 3 ) | (bpf_ntohs(iph->frag_off) & IP_MF ? IP6F_MORE_FRAG : 0);
+		ip6f->ip6f_ident = bpf_htonl(bpf_ntohs(iph->id));
+	}
+	return checksum;
+}
+
 static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 	long rc;
 	if(UNLIKELY((rc = bpf_xdp_ensure_ipv4_header(pbf, offset)) < 0)){
@@ -253,73 +327,52 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 	if(iph->ttl <= 1){
 		return icmp_send(pbf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
 	}
-	
-	//int is_icmp = iph.protocol == IPPROTO_ICMP;
-	int is_frag = bpf_ntohs(iph->frag_off) & IP_MF || bpf_ntohs(iph->frag_off) & IP_OFFMASK;
+	iph->ttl -= 1;
 
-	struct in6_addr src, dst;
+	const struct ipv4_nat_table_value *src, *dst;
+	src = ipv4_siit_table_lookup((const struct in_addr *)&iph->saddr, &src_4to6_map);
+	if(UNLIKELY(src == NULL)){
+		bpf_printk("sno");
+		return -ENOENT;
+	}
+	if(UNLIKELY(!is_ipv4_siit_table_entry_valid(src))){
+		bpf_printk("sinv");
+		return -EINVAL;
+	}
+	dst = ipv4_siit_table_lookup((const struct in_addr *)&iph->daddr, &dst_4to6_map);
+	if(UNLIKELY(dst == NULL)){
+		bpf_printk("dno");
+		return -ENOENT;
+	}
+	if(UNLIKELY(!is_ipv4_siit_table_entry_valid(dst))){
+		bpf_printk("dinv");
+		return -EINVAL;
+	}
 
-	uint64_t checksum_diff = 0;
-	rc = addr_translate_4to6((const struct in_addr *)&iph->saddr, &src, &src_4to6_map);
-	if(rc < 0){
-		return rc;
-	}
-	checksum_diff += rc;
-	rc = addr_translate_4to6((const struct in_addr *)&iph->daddr, &dst, &dst_4to6_map);
-	if(rc < 0){
-		return rc;
-	}
-	checksum_diff += rc;
-	ssize_t len_diff = sizeof(struct ip6_hdr) - iph->ihl * 4;
-	if(is_frag){
-		len_diff += sizeof(struct ip6_frag);
-	}
+	ssize_t len_diff = calc_extra_space_ip4_hdr(iph);
 	if(len_diff){
 		rc = bpf_xdp_adjust_head_at(pbf, len_diff, offset);
 		if(UNLIKELY(rc < 0)){
+			bpf_printk("eadj");
 			return rc;
 		}
 	}
 	struct ip6_hdr *ip6h = (struct ip6_hdr *)(pbf->data + offset);
-	void *transp_hdr = (void *)(ip6h + 1);
+	void *transp_hdr;
 	bpf_xdp_valid_ptr(pbf, ip6h);
 
-	ip6h->ip6_flow = bpf_htonl(6 << 28 | iph->tos << 20);
-	ip6h->ip6_plen = bpf_htons(bpf_ntohs(iph->tot_len) - iph->ihl * 4 + (is_frag ? sizeof(struct ip6_frag) : 0));
-	ip6h->ip6_nxt  = iph->protocol;
-	ip6h->ip6_hlim = iph->ttl - 1;
-	ip6h->ip6_src  = src;
-	ip6h->ip6_dst  = dst;
-	if(is_frag){
-		struct ip6_frag *ip6f = (struct ip6_frag *)(ip6h + 1);
-		transp_hdr = (void *)(ip6f + 1);
-		bpf_xdp_valid_ptr(pbf, ip6f);
-		ip6f->ip6f_nxt = ip6h->ip6_nxt;
-		ip6h->ip6_nxt = IPPROTO_FRAGMENT;
-		ip6f->ip6f_reserved = 0;
-		ip6f->ip6f_offlg = bpf_htons((bpf_ntohs(iph->frag_off) & IP_OFFMASK) << 3 ) | (bpf_ntohs(iph->frag_off) & IP_MF ? IP6F_MORE_FRAG : 0);
-		ip6f->ip6f_ident = bpf_htonl(bpf_ntohs(iph->id));
+	rc = fill_ipv6_hdr(ip6h, iph, dst, src, &transp_hdr, pbf);
+	if(UNLIKELY(rc < 0)){
+		bpf_printk("efil");
+		return rc;
 	}
-	
-	if(iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP){
-		uint16_t *checksum_ptr = NULL;
-		if(iph->protocol == IPPROTO_TCP){
-			struct tcphdr *tcph = (struct tcphdr *)transp_hdr;
-			checksum_ptr = &tcph->check;
-		}else if(iph->protocol == IPPROTO_UDP){
-			struct udphdr *udph = (struct udphdr *)transp_hdr;
-			checksum_ptr = &udph->check;
-		}
-		bpf_xdp_valid_ptr(pbf, checksum_ptr);
-		checksum_diff += (0xffff ^ *checksum_ptr);
-		checksum_diff = (checksum_diff & 0xffffffff) + ((checksum_diff >> 32) & 0xffffffff);
-		checksum_diff = (checksum_diff & 0xffff) + ((checksum_diff >> 16) & 0xffff);
-		checksum_diff = (checksum_diff & 0xffff) + ((checksum_diff >> 16) & 0xffff);
-		checksum_diff &= 0xffff;
-		if(checksum_diff == 0xffff) checksum_diff = 0;
-		*checksum_ptr = 0xffff ^ checksum_diff;
+
+	uint64_t checksum_diff = rc;
+	rc = checksum_fill_delta(pbf, transp_hdr, iph->protocol, checksum_diff);	
+	if(UNLIKELY(rc < 0)){
+		bpf_printk("cksu");
+		return rc;
 	}
-	
 	return 0;
 }
 
