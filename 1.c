@@ -679,8 +679,8 @@ static __always_inline long eth_ipv4_to_6(struct xdp_md *pbf){
 	return -EINVAL;
 }
 
-SEC("xdp/4to6")
-long xslat46(struct xdp_md *pbf)
+SEC("xdp/xlat4to6")
+long xlat46(struct xdp_md *pbf)
 {
 	long rc = eth_ipv4_to_6(pbf);
 	if(rc < 0){
