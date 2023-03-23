@@ -41,7 +41,9 @@
 # define memmove(dest, src, n)  __builtin_memmove((dest), (src), (n))
 #endif
 
-const int MAP_MAX_LEN = 1024;
+#define MAP_MAX_LEN 1024
+#define NEUTRALIZE_IPADDR
+#define NEUTRALIZE_IPADDR_DST
 
 struct ipv4_lpm_key {
     __u32 prefixlen;
@@ -258,6 +260,12 @@ static __always_inline long is_ipv4_siit_table_entry_valid(const struct ipv4_nat
 	return value->ip6_prefixlen <= 128  && value->ip4_prefixlen <= 32 && value->ip6_prefixlen + 32 - value->ip4_prefixlen <= 128;
 }
 
+#ifdef NEUTRALIZE_IPADDR
+static __always_inline long is_ipv4_siit_table_entry_neutralizable(const struct ipv4_nat_table_value *value){
+	return value->ip6_prefixlen +  32 - value->ip4_prefixlen + 16 <= 128;
+}
+#endif /* defined NEUTRALIZE_IPADDR */
+
 static __always_inline uint64_t checksum_fold(uint64_t cksum){
 	cksum = (cksum & 0xffffffff) + ((cksum >> 32) & 0xffffffff);
 	cksum = (cksum & 0xffffffff) + ((cksum >> 32) & 0xffffffff);
@@ -334,7 +342,11 @@ static __always_inline long icmp4_should_trans(struct xdp_md *pbf, const struct 
 	return ICMP4_XLAT_PAYLOAD;
 }
 
-static __always_inline long fill_ipv6_hdr(struct ip6_hdr *ip6h, const struct iphdr *iph, const struct ipv4_nat_table_value *dst, const struct ipv4_nat_table_value *src, void **transp_hdr, struct xdp_md *pbf){
+static __always_inline long fill_ipv6_hdr(struct ip6_hdr *ip6h, const struct iphdr *iph, const struct ipv4_nat_table_value *dst, const struct ipv4_nat_table_value *src, void **transp_hdr, struct xdp_md *pbf
+#ifdef NEUTRALIZE_IPADDR
+	, int neutralize_dst
+#endif /* defined NEUTRALIZE_IPADDR */
+){
 	if(LIKELY(!!pbf)){
 		bpf_xdp_valid_ptr(pbf, ip6h);
 	}
@@ -363,6 +375,21 @@ static __always_inline long fill_ipv6_hdr(struct ip6_hdr *ip6h, const struct iph
 		ip6f->ip6f_offlg = bpf_htons((bpf_ntohs(iph->frag_off) & IP_OFFMASK) << 3 ) | (bpf_ntohs(iph->frag_off) & IP_MF ? IP6F_MORE_FRAG : 0);
 		ip6f->ip6f_ident = bpf_htonl(bpf_ntohs(iph->id));
 	}
+#ifdef NEUTRALIZE_IPADDR
+	const struct ipv4_nat_table_value *neutralized_item;
+	struct in6_addr *neutralized_addr;
+	if(neutralize_dst){
+		neutralized_item = dst;
+		neutralized_addr = &ip6h->ip6_dst;
+	}else{
+		neutralized_item = src;
+		neutralized_addr = &ip6h->ip6_src;
+	}
+	if(is_ipv4_siit_table_entry_neutralizable(neutralized_item)){
+		neutralized_addr->s6_addr16[7] = 0xffff ^ checksum_fold(checksum);
+		checksum = 0;
+	}
+#endif /* defined(NEUTRALIZE_IPADDR) */
 	return checksum;
 }
 
@@ -588,7 +615,16 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 	void *transp_hdr;
 	bpf_xdp_valid_ptr(pbf, ip6h);
 
-	rc = fill_ipv6_hdr(ip6h, iph, dst, src, &transp_hdr, pbf);
+	rc = fill_ipv6_hdr(ip6h, iph, dst, src, &transp_hdr, pbf
+#ifdef NEUTRALIZE_IPADDR
+		, 
+#  ifdef NEUTRALIZE_IPADDR_DST
+		1
+#  else
+		0
+#  endif
+#endif
+	);
 	if(UNLIKELY(rc < 0)){
 		return rc;
 	}
@@ -611,7 +647,16 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 				icmp_iph->protocol = IPPROTO_ICMPV6;
 				checksum_diff += (IPPROTO_ICMPV6 << 8) + (0xffff ^ (IPPROTO_ICMP << 8));
 			}
-			rc = fill_ipv6_hdr(icmp6_ip6h, icmp_iph, icmp_ip_dst, icmp_ip_src, &inner_transp_hdr, pbf);
+			rc = fill_ipv6_hdr(icmp6_ip6h, icmp_iph, icmp_ip_dst, icmp_ip_src, &inner_transp_hdr, pbf
+#ifdef NEUTRALIZE_IPADDR
+				, 
+#  ifdef NEUTRALIZE_IPADDR_DST
+				0
+#  else
+				1
+#  endif
+#endif
+			);
 			if(UNLIKELY(rc < 0)){
 				return rc;
 			}
