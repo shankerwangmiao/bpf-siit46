@@ -4,7 +4,6 @@
 #include <bpf/bpf_endian.h>
 #include <linux/pkt_cls.h>
 #include <stdint.h>
-#include <iproute2/bpf_elf.h>
 #include <netinet/icmp6.h>
 #include <netinet/ip.h>
 #include <netinet/in.h>
@@ -46,7 +45,10 @@ const int MAP_MAX_LEN = 1024;
 
 struct ipv4_lpm_key {
     __u32 prefixlen;
-    struct in_addr addr;		
+	union{
+		struct in_addr addr;
+		uint8_t addr8[4];
+	};
 };
 
 struct ipv4_nat_table_value {
@@ -56,25 +58,23 @@ struct ipv4_nat_table_value {
 	struct in6_addr addr;
 };
 
-SEC("maps")
-struct bpf_elf_map src_4to6_map = {
-	.type = BPF_MAP_TYPE_LPM_TRIE,
-	.size_key = sizeof(struct ipv4_lpm_key),
-	.size_value = sizeof(struct ipv4_nat_table_value),
-	.pinning = PIN_GLOBAL_NS,
-	.max_elem = MAP_MAX_LEN,
-	.flags = BPF_F_NO_PREALLOC,
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct ipv4_lpm_key);
+	__type(value, struct ipv4_nat_table_value);
+	__uint(max_entries, MAP_MAX_LEN);
+	__uint(map_flags, (BPF_F_NO_PREALLOC | BPF_F_RDONLY_PROG));
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} src_4to6_map SEC(".maps");
 
-SEC("maps")
-struct bpf_elf_map dst_4to6_map = {
-	.type = BPF_MAP_TYPE_LPM_TRIE,
-	.size_key = sizeof(struct ipv4_lpm_key),
-	.size_value = sizeof(struct ipv4_nat_table_value),
-	.pinning = PIN_GLOBAL_NS,
-	.max_elem = MAP_MAX_LEN,
-	.flags = BPF_F_NO_PREALLOC,
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct ipv4_lpm_key);
+	__type(value, struct ipv4_nat_table_value);
+	__uint(max_entries, MAP_MAX_LEN);
+	__uint(map_flags, (BPF_F_NO_PREALLOC | BPF_F_RDONLY_PROG));
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} dst_4to6_map SEC(".maps");
 
 
 static __always_inline long bpf_xdp_is_data_sz_gt(const struct xdp_md *pbf, size_t size){
@@ -242,7 +242,7 @@ static __always_inline ssize_t calc_extra_space_ip4_hdr(const struct iphdr *iph)
 	return len_diff;
 }
 
-static __always_inline const struct ipv4_nat_table_value *ipv4_siit_table_lookup(const struct in_addr *addr4, struct bpf_elf_map *map){
+static __always_inline const struct ipv4_nat_table_value *ipv4_siit_table_lookup(const struct in_addr *addr4, void *map){
 	struct ipv4_lpm_key key = {
 		.prefixlen = 32,
 		.addr = *addr4,
@@ -679,7 +679,7 @@ static __always_inline long eth_ipv4_to_6(struct xdp_md *pbf){
 	return -EINVAL;
 }
 
-SEC("xdp:4to6")
+SEC("xdp/4to6")
 long xslat46(struct xdp_md *pbf)
 {
 	long rc = eth_ipv4_to_6(pbf);
