@@ -16,10 +16,16 @@
 #include <linux/ipv6.h>
 
 
+#ifndef __maybe_unused
+# define __maybe_unused         __attribute__((__unused__))
+#endif
+
+#undef __always_inline          /* stddef.h defines its own */
+#define __always_inline         inline __attribute__((always_inline))
 
 // helper macros for branch prediction
-#define LIKELY(x)   __builtin_expect((x), 1)
-#define UNLIKELY(x) __builtin_expect((x), 0)
+#define LIKELY(x)   __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
 
 /* Helper macro to print out debug messages */
 #define bpf_printk(fmt, ...)                            \
@@ -42,8 +48,8 @@
 #endif
 
 #define MAP_MAX_LEN 1024
-#define NEUTRALIZE_IPADDR
-#define NEUTRALIZE_IPADDR_DST
+//#define NEUTRALIZE_IPADDR
+//#define NEUTRALIZE_IPADDR_DST
 
 struct ipv4_lpm_key {
     __u32 prefixlen;
@@ -79,16 +85,29 @@ struct {
 } dst_4to6_map SEC(".maps");
 
 
-static __always_inline long bpf_xdp_is_data_sz_gt(const struct xdp_md *pbf, size_t size){
-	return (unsigned long)pbf->data + size <= (unsigned long)pbf->data_end;
+static __always_inline long bpf_skb_is_data_sz_gt(const struct __sk_buff *skb, size_t size){
+	return (unsigned long)skb->data + size <= (unsigned long)skb->data_end;
 }
 
-static __always_inline long bpf_xdp_ensure_bytes(struct xdp_md *pbf, size_t size){
-	if(LIKELY(bpf_xdp_is_data_sz_gt(pbf, size))){
+static __always_inline long bpf_skb_ensure_bytes(struct __sk_buff *skb, size_t size){
+	if(LIKELY(bpf_skb_is_data_sz_gt(skb, size))){
 		return 0;
 	}
-	return -EINVAL;
+	long rc = bpf_skb_pull_data(skb, size);
+	if(UNLIKELY(rc < 0)){
+		return rc;
+	}
+	if(UNLIKELY(bpf_skb_is_data_sz_gt(skb, size))){
+		return -EINVAL;
+	}
+	return 0;
 }
+
+#define bpf_skb_valid_ptr(skb, ptr) \
+       ({if(UNLIKELY((void *)((ptr) + 1) > (void *)(unsigned long)((skb)->data_end))){ \
+               return -EINVAL; \
+       }})
+#define bpf_skb_ptr(skb, offset)((void *)((unsigned long)(skb)->data + (offset)))
 
 
 static __always_inline long addr_translate_4to6 (const struct in_addr *addr4, struct in6_addr *addr6, const struct ipv4_nat_table_value *value){
@@ -148,7 +167,7 @@ static __always_inline long addr_translate_4to6 (const struct in_addr *addr4, st
 	return checksum;
 }
 
-static __always_inline long icmp_send(struct xdp_md *pbf, __u8 type, __u8 code, __u32 info){
+static __always_inline long icmp_send(struct __sk_buff *skb, __u8 type, __u8 code, __u32 info){
 	return -ENOSYS;
 }
 
@@ -160,19 +179,20 @@ static __always_inline long is_ip_fragment(const struct iphdr *iph){
 	return bpf_ntohs(iph->frag_off) & IP_MF || bpf_ntohs(iph->frag_off) & IP_OFFMASK;
 }
 
-static __always_inline int bpf_xdp_ensure_ipv4_header(struct xdp_md *pbf, size_t offset){
-	int rc;
-	if(UNLIKELY((rc = bpf_xdp_ensure_bytes(pbf, offset + sizeof(struct iphdr))) < 0)){
+static __always_inline long bpf_skb_ensure_ipv4_header(struct __sk_buff *skb, size_t offset){
+	long rc;
+	if(UNLIKELY((rc = bpf_skb_ensure_bytes(skb, offset + sizeof(struct iphdr))) < 0)){
 		return rc;
 	}
-	const struct iphdr *iph = (struct iphdr *)(pbf->data + offset);
+	const struct iphdr *iph = (struct iphdr *)bpf_skb_ptr(skb, offset);
+	bpf_skb_valid_ptr(skb, iph);
 	if(UNLIKELY(iph->version != 4)){
 		return -EINVAL;
 	}
 	if(UNLIKELY(iph->ihl < sizeof(struct iphdr) / 4)){
 		return -EINVAL;
 	}
-	int length = iph->ihl * 4;
+	long length = iph->ihl * 4;
 	if(UNLIKELY(bpf_ntohs(iph->tot_len) < length)){
 		return -EINVAL;
 	}
@@ -193,46 +213,12 @@ static __always_inline int bpf_xdp_ensure_ipv4_header(struct xdp_md *pbf, size_t
 		if(UNLIKELY(bpf_ntohs(iph->tot_len) < length)){
 			return -EINVAL;
 		}
-		rc = bpf_xdp_ensure_bytes(pbf, offset + length);
+		rc = bpf_skb_ensure_bytes(skb, offset + length);
 		if(UNLIKELY(rc < 0)){
 			return rc;
 		}
 	}
 	return length;
-}
-
-#define bpf_xdp_valid_ptr(pbf, ptr) \
-	({if(UNLIKELY((void *)((ptr) + 1) > (void *)(unsigned long)((pbf)->data_end))){ \
-		return -EINVAL; \
-	}})
-#define bpf_xdp_valid_ptr_len(pbf, ptr, len) \
-	({if(UNLIKELY(((void *)(ptr) + (unsigned long)(len)) > (void *)(unsigned long)((pbf)->data_end))){ \
-		return -EINVAL; \
-	}})
-
-static __always_inline long bpf_xdp_adjust_head_at(struct xdp_md *pbf, ssize_t len_diff, size_t offset){
-	if(len_diff > 0){
-		long rc = bpf_xdp_adjust_head(pbf, -len_diff);
-		if(UNLIKELY(rc < 0)){
-			return rc;
-		}
-		void *dst = (void *)(unsigned long)pbf->data;
-		bpf_xdp_valid_ptr_len(pbf, dst, offset);
-		void *src = (void *)(unsigned long)(pbf->data + len_diff);
-		bpf_xdp_valid_ptr_len(pbf, src, offset);
-		memmove(dst, src, offset);
-	}else if(len_diff < 0){
-		void *dst = (void *)(unsigned long)(pbf->data - len_diff);
-		bpf_xdp_valid_ptr_len(pbf, dst, offset);
-		void *src = (void *)(unsigned long)(pbf->data);
-		bpf_xdp_valid_ptr_len(pbf, src, offset);
-		memmove(dst, src, offset);
-		long rc = bpf_xdp_adjust_head(pbf, -len_diff);
-		if(UNLIKELY(rc < 0)){
-			return rc;
-		}
-	}
-	return 0;
 }
 
 static __always_inline ssize_t calc_extra_space_ip4_hdr(const struct iphdr *iph){
@@ -266,7 +252,7 @@ static __always_inline long is_ipv4_siit_table_entry_neutralizable(const struct 
 }
 #endif /* defined NEUTRALIZE_IPADDR */
 
-static __always_inline uint64_t checksum_fold(uint64_t cksum){
+static __always_inline __maybe_unused uint64_t checksum_fold(uint64_t cksum){
 	cksum = (cksum & 0xffffffff) + ((cksum >> 32) & 0xffffffff);
 	cksum = (cksum & 0xffffffff) + ((cksum >> 32) & 0xffffffff);
 	cksum = (cksum & 0xffff) + ((cksum >> 16) & 0xffff);
@@ -275,7 +261,13 @@ static __always_inline uint64_t checksum_fold(uint64_t cksum){
 	return cksum;
 }
 
-static __always_inline long checksum_fill_delta(struct xdp_md *pbf, void *transp_hdr, uint8_t proto, uint64_t checksum_diff){
+static __always_inline uint64_t checksum_fold_into_4(uint64_t cksum){
+	cksum = (cksum & 0xffffffff) + ((cksum >> 32) & 0xffffffff);
+	cksum = (cksum & 0xffffffff) + ((cksum >> 32) & 0xffffffff);
+	return cksum;
+}
+
+static __always_inline long checksum_fill_delta(struct __sk_buff *skb, void *transp_hdr, uint8_t proto, uint64_t checksum_diff, int is_in_payload){
 	uint64_t delta_checksum = 0;
 	if(proto == IPPROTO_TCP || proto == IPPROTO_UDP || proto == IPPROTO_ICMPV6){
 		uint16_t *checksum_ptr = NULL;
@@ -289,13 +281,12 @@ static __always_inline long checksum_fill_delta(struct xdp_md *pbf, void *transp
 			struct icmp6_hdr *icmp6h = (struct icmp6_hdr *)transp_hdr;
 			checksum_ptr = &icmp6h->icmp6_cksum;
 		}
-		bpf_xdp_valid_ptr(pbf, checksum_ptr);
-		delta_checksum += 0xffff ^ *checksum_ptr;
-		checksum_diff += (0xffff ^ *checksum_ptr);
-		checksum_diff = checksum_fold(checksum_diff);
-		if(checksum_diff == 0xffff && proto == IPPROTO_UDP) checksum_diff = 0;
-		*checksum_ptr = 0xffff ^ checksum_diff;
-		delta_checksum += *checksum_ptr;
+		checksum_diff = checksum_fold_into_4(checksum_diff);
+		delta_checksum = 0xffffffff ^ checksum_diff;
+		long rc = bpf_l4_csum_replace(skb, (void *)checksum_ptr - (void *)(unsigned long)skb->data, 0, checksum_diff, 4 | (!is_in_payload ? BPF_F_PSEUDO_HDR : 0) | (proto == IPPROTO_UDP ? (BPF_F_MARK_MANGLED_0 | BPF_F_MARK_ENFORCE) : 0));
+		if(rc < 0){
+			return rc;
+		}
 	}
 	return delta_checksum;
 }
@@ -306,8 +297,8 @@ enum {
 	ICMP4_XLAT_PAYLOAD = 2
 };
 
-static __always_inline long icmp4_should_trans(struct xdp_md *pbf, const struct icmphdr *icmph){
-	bpf_xdp_valid_ptr(pbf, icmph);
+static __always_inline long icmp4_should_trans(struct __sk_buff *skb, const struct icmphdr *icmph){
+	bpf_skb_valid_ptr(skb, icmph);
 	if(icmph->type == ICMP_ECHO || icmph->type == ICMP_ECHOREPLY){
 		return ICMP4_XLAT_OK;
 	}else if(icmph->type == ICMP_DEST_UNREACH){
@@ -342,13 +333,13 @@ static __always_inline long icmp4_should_trans(struct xdp_md *pbf, const struct 
 	return ICMP4_XLAT_PAYLOAD;
 }
 
-static __always_inline long fill_ipv6_hdr(struct ip6_hdr *ip6h, const struct iphdr *iph, const struct ipv4_nat_table_value *dst, const struct ipv4_nat_table_value *src, void **transp_hdr, struct xdp_md *pbf
+static __always_inline long fill_ipv6_hdr(struct ip6_hdr *ip6h, const struct iphdr *iph, const struct ipv4_nat_table_value *dst, const struct ipv4_nat_table_value *src, uint64_t *checksum_diff, struct __sk_buff *skb
 #ifdef NEUTRALIZE_IPADDR
 	, int neutralize_dst
 #endif /* defined NEUTRALIZE_IPADDR */
 ){
-	if(LIKELY(!!pbf)){
-		bpf_xdp_valid_ptr(pbf, ip6h);
+	if(LIKELY(!!skb)){
+		bpf_skb_valid_ptr(skb, ip6h);
 	}
 	int is_frag = is_ip_fragment(iph);
 	ip6h->ip6_flow = bpf_htonl(6 << 28 | iph->tos << 20);
@@ -356,18 +347,15 @@ static __always_inline long fill_ipv6_hdr(struct ip6_hdr *ip6h, const struct iph
 	ip6h->ip6_nxt  = iph->protocol;
 	ip6h->ip6_hlim = iph->ttl;
 	long checksum = 0;
+	size_t transp_hdr_off = 0;
 	checksum += addr_translate_4to6((const struct in_addr *)&iph->saddr, &ip6h->ip6_src, src);
 	checksum += addr_translate_4to6((const struct in_addr *)&iph->daddr, &ip6h->ip6_dst, dst);
-	if(LIKELY(!!transp_hdr)){
-		*transp_hdr = (void *)(ip6h + 1);
-	}
+	transp_hdr_off = sizeof(struct ipv6hdr);
 	if(is_frag){
 		struct ip6_frag *ip6f = (struct ip6_frag *)(ip6h + 1);
-		if(LIKELY(!!transp_hdr)){
-			*transp_hdr = ip6f + 1;
-		}
-		if(LIKELY(!!pbf)){
-			bpf_xdp_valid_ptr(pbf, ip6f);
+		transp_hdr_off += sizeof(struct ip6_frag);
+		if(LIKELY(!!skb)){
+			bpf_skb_valid_ptr(skb, ip6f);
 		}
 		ip6f->ip6f_nxt = ip6h->ip6_nxt;
 		ip6h->ip6_nxt = IPPROTO_FRAGMENT;
@@ -390,13 +378,16 @@ static __always_inline long fill_ipv6_hdr(struct ip6_hdr *ip6h, const struct iph
 		checksum = 0;
 	}
 #endif /* defined(NEUTRALIZE_IPADDR) */
-	return checksum;
+	if(LIKELY(checksum_diff)){
+		*checksum_diff = checksum;
+	}
+	return transp_hdr_off;
 }
 
-static __always_inline long fill_icmp6_hdr(struct icmp6_hdr *icmp6h, const struct icmphdr *icmph, struct xdp_md *pbf){
+static __always_inline long fill_icmp6_hdr(struct icmp6_hdr *icmp6h, const struct icmphdr *icmph, struct __sk_buff *skb){
 	uint64_t checksum = 0;
-	if(LIKELY(!!pbf)){
-		bpf_xdp_valid_ptr(pbf, icmp6h);
+	if(LIKELY(!!skb)){
+		bpf_skb_valid_ptr(skb, icmp6h);
 	}
 	checksum += 0xffff ^ (*(uint16_t *)icmph);
 	checksum += 0xffffffff ^ (*((uint32_t *)icmph + 1));
@@ -516,18 +507,27 @@ static __always_inline uint64_t calc_icmpv6_pseudo_checksum(const struct ip6_hdr
 	return checksum;
 }
 
-static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
+#define bpf_skb_preserve_pointer(skb, ptr) \
+	({ \
+		ssize_t __off = (void *)(ptr) - (void *)(unsigned long)(skb)->data;
+#define bpf_skb_preserve_pointer_end(skb, ptr) \
+		ptr = (void *)(unsigned long)(skb)->data + __off; \
+		bpf_skb_valid_ptr(skb, ptr); \
+	})
+
+static __always_inline long ipv4_to_6(struct __sk_buff *skb, size_t offset){
 	long rc;
-	if(UNLIKELY((rc = bpf_xdp_ensure_ipv4_header(pbf, offset)) < 0)){
+	if(UNLIKELY((rc = bpf_skb_ensure_ipv4_header(skb, offset)) < 0)){
 		return rc;
 	}
 	//size_t total_hdr_len = rc;
-
-	struct iphdr _iph = *(struct iphdr *)(pbf->data + offset);
-	struct iphdr *iph = &_iph;
+	struct iphdr *iph = (struct iphdr *)bpf_skb_ptr(skb, offset);
+	bpf_skb_valid_ptr(skb, iph);
+	struct iphdr _iph = *iph;
+	iph = &_iph;
 
 	if(iph->ttl <= 1){
-		return icmp_send(pbf, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
+		return icmp_send(skb, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
 	}
 	iph->ttl -= 1;
 
@@ -561,15 +561,18 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 	const struct ipv4_nat_table_value *icmp_ip_src, *icmp_ip_dst;
 	ssize_t icmp_len_diff;
 	if(UNLIKELY(iph->protocol == IPPROTO_ICMP)){
-		struct icmphdr *icmph = (struct icmphdr *)(pbf->data + offset + iph->ihl * 4);
-		icmp_trans_type = icmp4_should_trans(pbf, icmph);
+		size_t icmph_off = offset + iph->ihl * 4;
+		struct icmphdr *icmph = bpf_skb_ptr(skb, icmph_off);
+		icmp_trans_type = icmp4_should_trans(skb, icmph);
 		if(icmp_trans_type == ICMP4_XLAT_DROP){
 			return -EINVAL;
 		}else if(icmp_trans_type == ICMP4_XLAT_PAYLOAD){
-			struct iphdr *icmp_iph = (struct iphdr *)(icmph + 1);
-			if(UNLIKELY((rc = bpf_xdp_ensure_ipv4_header(pbf, (void *)icmp_iph - (void *)(long)pbf->data)) < 0)){
+			if(UNLIKELY((rc = bpf_skb_ensure_ipv4_header(skb, icmph_off + sizeof(struct icmphdr))) < 0)){
 				return rc;
 			}
+			icmph = bpf_skb_ptr(skb, icmph_off);
+			struct iphdr *icmp_iph = (struct iphdr *)(icmph + 1);
+			bpf_skb_valid_ptr(skb, icmp_iph);
 			if(icmp_iph->protocol == IPPROTO_ICMP && is_ip_fragment(icmp_iph)){
 				return -ENOSYS;
 			}
@@ -594,7 +597,7 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 		}else{ /*Do nothing*/
 
 		}
-		bpf_xdp_valid_ptr(pbf, icmph);
+		bpf_skb_valid_ptr(skb, icmph);
 		_icmph = *icmph;
 		iph->protocol = IPPROTO_ICMPV6;
 	}else{ // Fill uninitialized variables to make verifier happy
@@ -602,8 +605,15 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 		memset(&_icmph, 0, sizeof(_icmph));
 		memset(&_icmp_iph, 0, sizeof(_icmp_iph));
 	}
-	if(LIKELY(len_diff != 0)){
-		rc = bpf_xdp_adjust_head_at(pbf, len_diff, offset);
+	rc = bpf_skb_change_proto(skb, bpf_htons(ETH_P_IPV6), 0);
+	if(UNLIKELY(rc < 0)){
+		return rc;
+	}
+	len_diff -= sizeof(struct ipv6hdr) - sizeof(struct iphdr);
+
+	if(UNLIKELY(len_diff != 0)){
+		//rc = bpf_xdp_adjust_head_at(pbf, len_diff, offset);
+		rc = bpf_skb_adjust_room(skb, len_diff, BPF_ADJ_ROOM_MAC, 0);
 		if(UNLIKELY(rc < 0)){
 			return rc;
 		}
@@ -611,11 +621,11 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 	if(UNLIKELY(icmp_trans_type == ICMP4_XLAT_PAYLOAD)){
 		iph->tot_len = bpf_htons(bpf_ntohs(iph->tot_len) + icmp_len_diff);
 	}
-	struct ip6_hdr *ip6h = (struct ip6_hdr *)(pbf->data + offset);
-	void *transp_hdr;
-	bpf_xdp_valid_ptr(pbf, ip6h);
+	struct ip6_hdr *ip6h = bpf_skb_ptr(skb, offset);
+	bpf_skb_valid_ptr(skb, ip6h);
 
-	rc = fill_ipv6_hdr(ip6h, iph, dst, src, &transp_hdr, pbf
+	uint64_t checksum_diff = 0;
+	rc = fill_ipv6_hdr(ip6h, iph, dst, src, &checksum_diff, skb
 #ifdef NEUTRALIZE_IPADDR
 		, 
 #  ifdef NEUTRALIZE_IPADDR_DST
@@ -628,13 +638,12 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 	if(UNLIKELY(rc < 0)){
 		return rc;
 	}
-	uint64_t checksum_diff = 0;
-	checksum_diff += rc;
+	size_t transp_hdr_off = rc + offset;
 
 	if(iph->protocol == IPPROTO_ICMPV6){
 		checksum_diff = calc_icmpv6_pseudo_checksum(ip6h);
-		struct icmp6_hdr *icmp6h = (struct icmp6_hdr *)transp_hdr;
-		rc = fill_icmp6_hdr(icmp6h, icmph, pbf);
+		struct icmp6_hdr *icmp6h = bpf_skb_ptr(skb, transp_hdr_off);
+		rc = fill_icmp6_hdr(icmp6h, icmph, skb);
 		if(UNLIKELY(rc < 0)){
 			return rc;
 		}
@@ -647,7 +656,8 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 				icmp_iph->protocol = IPPROTO_ICMPV6;
 				checksum_diff += (IPPROTO_ICMPV6 << 8) + (0xffff ^ (IPPROTO_ICMP << 8));
 			}
-			rc = fill_ipv6_hdr(icmp6_ip6h, icmp_iph, icmp_ip_dst, icmp_ip_src, &inner_transp_hdr, pbf
+			uint64_t inner_checksum_diff = 0;
+			rc = fill_ipv6_hdr(icmp6_ip6h, icmp_iph, icmp_ip_dst, icmp_ip_src, &inner_checksum_diff, skb
 #ifdef NEUTRALIZE_IPADDR
 				, 
 #  ifdef NEUTRALIZE_IPADDR_DST
@@ -660,8 +670,8 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 			if(UNLIKELY(rc < 0)){
 				return rc;
 			}
-			uint64_t inner_checksum_diff = rc;
-			checksum_diff += rc; // Include Address Diff
+			inner_transp_hdr = (void *)icmp6_ip6h + rc;
+			checksum_diff += inner_checksum_diff; // Include Address Diff
 			checksum_diff += 0xffffffff ^ (*((uint32_t *) icmp_iph + 0)); // Cancel IPv4 Ver IHL TOS LEN
 			checksum_diff += 0xffffffff ^ (*((uint32_t *) icmp_iph + 1)); // Cancel IPv4 ID, Flags, Frag Offset
 			checksum_diff += 0xffffffff ^ (*((uint32_t *) icmp_iph + 2)); // Cancel IPv4 TTL, Protocol, Checksum
@@ -671,7 +681,7 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 
 			if(icmp6_ip6h->ip6_nxt == IPPROTO_FRAGMENT){ // Include Possible Fragment Header
 				struct ip6_frag *icmp6_ip6f = (struct ip6_frag *)(icmp6_ip6h + 1);
-				bpf_xdp_valid_ptr(pbf, icmp6_ip6f);
+				bpf_skb_valid_ptr(skb, icmp6_ip6f);
 				checksum_diff += *((uint32_t *) icmp6_ip6f + 0);
 				checksum_diff += *((uint32_t *) icmp6_ip6f + 1);
 			}
@@ -680,7 +690,7 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 				if(icmp_iph->protocol == IPPROTO_ICMPV6){
 					inner_checksum_diff = 0;
 					struct icmp6_hdr *inner_icmp6h = (struct icmp6_hdr *)inner_transp_hdr;
-					bpf_xdp_valid_ptr(pbf, inner_icmp6h); // Make the verifier happy
+					bpf_skb_valid_ptr(skb, inner_icmp6h); // Make the verifier happy
 					if(inner_icmp6h->icmp6_type == ICMP_ECHO){
 						inner_checksum_diff += (0xffff ^ ICMP_ECHO) + ICMP6_ECHO_REQUEST;
 						inner_icmp6h->icmp6_type = ICMP6_ECHO_REQUEST;
@@ -691,7 +701,7 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 					checksum_diff += inner_checksum_diff; //Include ICMPv6 Type Code Checksum
 					inner_checksum_diff += calc_icmpv6_pseudo_checksum(icmp6_ip6h);
 				}
-				rc = checksum_fill_delta(pbf, inner_transp_hdr, icmp_iph->protocol, inner_checksum_diff);
+				rc = checksum_fill_delta(skb, inner_transp_hdr, icmp_iph->protocol, inner_checksum_diff, 1);
 				if(UNLIKELY(rc < 0)){
 					return rc;
 				}
@@ -700,7 +710,7 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 		}
 	}
 	if(LIKELY(!is_ip_following_fragment(iph))){
-		rc = checksum_fill_delta(pbf, transp_hdr, iph->protocol, checksum_diff);
+		rc = checksum_fill_delta(skb, bpf_skb_ptr(skb, transp_hdr_off), iph->protocol, checksum_diff, 0);
 		if(UNLIKELY(rc < 0)){
 			return rc;
 		}
@@ -708,30 +718,30 @@ static __always_inline long ipv4_to_6(struct xdp_md *pbf, size_t offset){
 	return 0;
 }
 
-static __always_inline long eth_ipv4_to_6(struct xdp_md *pbf){
-	struct ethhdr *ethh = (struct ethhdr *)(unsigned long)pbf->data;
-	bpf_xdp_valid_ptr(pbf, ethh);
+static __always_inline long eth_ipv4_to_6(struct __sk_buff *skb){
+	struct ethhdr *ethh = bpf_skb_ptr(skb, 0);
+	bpf_skb_valid_ptr(skb, ethh);
 	if(ethh->h_proto == bpf_htons(ETH_P_IP)){
-		long rc = ipv4_to_6(pbf, sizeof(struct ethhdr));
+		long rc = ipv4_to_6(skb, sizeof(struct ethhdr));
 		if(UNLIKELY(rc < 0)){
 			return rc;
 		}
-		ethh = (struct ethhdr *)(unsigned long)pbf->data;
-		bpf_xdp_valid_ptr(pbf, ethh);
+		ethh = bpf_skb_ptr(skb, 0);
+		bpf_skb_valid_ptr(skb, ethh);
 		ethh->h_proto = bpf_htons(ETH_P_IPV6);
 		return 0;
 	}
 	return -EINVAL;
 }
 
-SEC("xdp/xlat4to6")
-long xlat46(struct xdp_md *pbf)
+SEC("tc/xlat4to6")
+long xlat46(struct __sk_buff *skb)
 {
-	long rc = eth_ipv4_to_6(pbf);
+	long rc = eth_ipv4_to_6(skb);
 	if(rc < 0){
-		return XDP_DROP;
+		return TC_ACT_SHOT;
 	}else{
-		return XDP_PASS;
+		return TC_ACT_OK;
 	}
 }
 
